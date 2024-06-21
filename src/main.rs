@@ -1,10 +1,12 @@
 use clap::{Arg, Command};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
@@ -56,6 +58,7 @@ fn hex_encode(bytes: &[u8; 32]) -> String {
     s
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn calculate_score(result: &[u8; 32]) -> u32 {
     let mut score = 0u32;
@@ -82,6 +85,25 @@ unsafe fn calculate_score(result: &[u8; 32]) -> u32 {
         }
         score += 32;
     }
+    score
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn calculate_score(result: &[u8; 32]) -> u32 {
+    let mut score = 0u32;
+
+    for &byte in result.iter() {
+        if byte == 0 {
+            score += 2;
+        } else {
+            if byte < 16 {
+                score += 1;
+            }
+            break;
+        }
+    }
+
     score
 }
 
