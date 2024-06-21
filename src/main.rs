@@ -1,30 +1,31 @@
 use clap::{Arg, Command};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::arch::x86_64::*;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+const MAX_PREFIX_LEN: usize = 32;
+
 #[inline(always)]
 fn increment_nonce(buffer: &mut [u8; 64], start: usize) -> usize {
-    let mut i = start;
-    while i > 0 {
-        if buffer[i - 1] == b'9' {
-            buffer[i - 1] = b'0';
+    let mut i = start - 1;
+    loop {
+        if buffer[i] == b'9' {
+            buffer[i] = b'0';
+            if i == 0 {
+                buffer[start] = b'1';
+                return start + 1;
+            }
             i -= 1;
         } else {
-            buffer[i - 1] += 1;
-            break;
+            buffer[i] += 1;
+            return start;
         }
-    }
-    if i == 0 {
-        buffer[start] = b'1';
-        start + 1
-    } else {
-        start
     }
 }
 
@@ -42,6 +43,46 @@ fn get_nonce_start_delta(mut n: u64, buf: &mut [u8]) -> usize {
     }
     buf[..i].reverse();
     i
+}
+
+#[inline(always)]
+fn hex_encode(bytes: &[u8; 32]) -> String {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(64);
+    for &b in bytes {
+        s.push(HEX_CHARS[(b >> 4) as usize] as char);
+        s.push(HEX_CHARS[(b & 0xf) as usize] as char);
+    }
+    s
+}
+
+#[inline(always)]
+unsafe fn calculate_score(result: &[u8; 32]) -> u32 {
+    let mut score = 0u32;
+    let zero = _mm_setzero_si128();
+    let low_mask = _mm_set1_epi8(0x0F);
+
+    for chunk in result.chunks(16) {
+        let v = _mm_loadu_si128(chunk.as_ptr() as *const __m128i);
+        let full_zero_mask = _mm_cmpeq_epi8(v, zero);
+        let full_zero_bits = _mm_movemask_epi8(full_zero_mask) as u32;
+
+        if full_zero_bits != 0xFFFF {
+            let low_nibbles = _mm_and_si128(v, low_mask);
+            let half_zero_mask = _mm_cmpeq_epi8(low_nibbles, zero);
+            let half_zero_bits = _mm_movemask_epi8(half_zero_mask) as u32;
+
+            let leading_full_zeros = full_zero_bits.trailing_ones();
+            score += leading_full_zeros * 2;
+
+            if (half_zero_bits & !full_zero_bits) & (1 << leading_full_zeros) != 0 {
+                score += 1;
+            }
+            break;
+        }
+        score += 32;
+    }
+    score
 }
 
 fn main() {
@@ -95,9 +136,11 @@ fn main() {
         .get_one::<String>("prefix")
         .expect("prefix argument is required");
 
-    let prefix_bytes = prefix.as_bytes();
+    let mut prefix_bytes = [0u8; MAX_PREFIX_LEN];
+    let prefix_len = prefix.len().min(MAX_PREFIX_LEN);
+    prefix_bytes[..prefix_len].copy_from_slice(&prefix.as_bytes()[..prefix_len]);
 
-    let global_best_score = Arc::new(AtomicUsize::new(0));
+    let global_best_score = Arc::new(AtomicU32::new(0));
     let global_best_nonce = Arc::new(AtomicUsize::new(0));
     let global_best_hash = Arc::new(parking_lot::RwLock::new([0u8; 32]));
     let current_start = Arc::new(AtomicUsize::new(start as usize));
@@ -118,10 +161,10 @@ fn main() {
                         std::ptr::copy_nonoverlapping(
                             prefix_bytes.as_ptr(),
                             buffer.as_mut_ptr(),
-                            prefix_bytes.len(),
+                            prefix_len,
                         );
                     }
-                    let mut nonce_start = prefix_bytes.len();
+                    let mut nonce_start = prefix_len;
                     nonce_start +=
                         get_nonce_start_delta(chunk_start as u64, &mut buffer[nonce_start..]);
 
@@ -134,15 +177,7 @@ fn main() {
                         hasher.update(&buffer[..nonce_start]);
                         let result = hasher.finalize_reset();
 
-                        let score = result.iter().take(4).fold(0, |acc, &byte| {
-                            if byte == 0 {
-                                acc + 2
-                            } else if byte < 16 {
-                                acc + 1
-                            } else {
-                                acc
-                            }
-                        });
+                        let score = unsafe { calculate_score(result.as_ref()) };
 
                         if score > local_best_score
                             || (score == local_best_score && n < local_best_nonce)
@@ -177,7 +212,7 @@ fn main() {
                                 "\nNew min with {} zeroes: {} -> {}\n",
                                 local_best_score,
                                 format!("{}{}", prefix, local_best_nonce),
-                                hex::encode(&*global_hash)
+                                hex_encode(&*global_hash)
                             );
                         }
                     }
@@ -195,7 +230,7 @@ fn main() {
             hps / 1e6,
             global_best_score.load(Ordering::Relaxed),
             format!("{}{}", prefix, global_best_nonce.load(Ordering::Relaxed)),
-            hex::encode(&*global_best_hash.read())
+            hex_encode(&*global_best_hash.read())
         );
     }
 }
