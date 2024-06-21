@@ -1,6 +1,6 @@
 # shallenge
 
-CPU bruteforcer for https://shallenge.quirino.net hitting ~400 MH/s on a Ryzen 9 3950X.
+CPU bruteforcer for https://shallenge.quirino.net hitting ~480 MH/s on a Ryzen 9 3950X.
 
 ### Usage
 

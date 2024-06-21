@@ -9,36 +9,39 @@ use std::time::Instant;
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 #[inline(always)]
-fn nonce_to_bytes(n: u64, buffer: &mut [u8]) -> usize {
-    if n < 10 {
-        buffer[0] = n as u8 + b'0';
-        return 1;
-    }
-    let mut len = 0;
-    let mut num = n;
-    while num > 0 {
-        buffer[len] = (num % 10) as u8 + b'0';
-        num /= 10;
-        len += 1;
-    }
-    buffer[..len].reverse();
-    len
-}
-
-#[inline(always)]
-fn score(hash: &[u8; 32]) -> u32 {
-    let mut score = 0;
-    for &byte in hash.iter().take(4) {
-        if byte == 0 {
-            score += 2;
+fn increment_nonce(buffer: &mut [u8; 64], start: usize) -> usize {
+    let mut i = start;
+    while i > 0 {
+        if buffer[i - 1] == b'9' {
+            buffer[i - 1] = b'0';
+            i -= 1;
         } else {
-            if byte < 16 {
-                score += 1;
-            }
+            buffer[i - 1] += 1;
             break;
         }
     }
-    score
+    if i == 0 {
+        buffer[start] = b'1';
+        start + 1
+    } else {
+        start
+    }
+}
+
+#[inline(always)]
+fn get_nonce_start_delta(mut n: u64, buf: &mut [u8]) -> usize {
+    if n == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut i = 0;
+    while n > 0 {
+        buf[i] = (n % 10) as u8 + b'0';
+        n /= 10;
+        i += 1;
+    }
+    buf[..i].reverse();
+    i
 }
 
 fn main() {
@@ -96,7 +99,7 @@ fn main() {
 
     let global_best_score = Arc::new(AtomicUsize::new(0));
     let global_best_nonce = Arc::new(AtomicUsize::new(0));
-    let global_best_hash = Arc::new(parking_lot::RwLock::new(String::new()));
+    let global_best_hash = Arc::new(parking_lot::RwLock::new([0u8; 32]));
     let current_start = Arc::new(AtomicUsize::new(start as usize));
 
     loop {
@@ -111,50 +114,70 @@ fn main() {
             .for_each_with(
                 (Sha256::new(), [0u8; 64]),
                 |(hasher, buffer), chunk_start| {
-                    buffer[..prefix_bytes.len()].copy_from_slice(prefix_bytes);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            prefix_bytes.as_ptr(),
+                            buffer.as_mut_ptr(),
+                            prefix_bytes.len(),
+                        );
+                    }
+                    let mut nonce_start = prefix_bytes.len();
+                    nonce_start +=
+                        get_nonce_start_delta(chunk_start as u64, &mut buffer[nonce_start..]);
+
                     let chunk_end = (chunk_start + 16384).min(range_end);
                     let mut local_best_score = 0;
                     let mut local_best_nonce = 0;
                     let mut local_best_hash = [0u8; 32];
 
                     for n in chunk_start..chunk_end {
-                        let prefix_len = prefix_bytes.len();
-                        let nonce_len = nonce_to_bytes(n as u64, &mut buffer[prefix_len..]);
-                        hasher.update(&buffer[..prefix_len + nonce_len]);
-                        let result: [u8; 32] = hasher.finalize_reset().into();
-                        let s = score(&result);
+                        hasher.update(&buffer[..nonce_start]);
+                        let result = hasher.finalize_reset();
 
-                        if s > local_best_score || (s == local_best_score && n < local_best_nonce) {
-                            local_best_score = s;
+                        let score = result.iter().take(4).fold(0, |acc, &byte| {
+                            if byte == 0 {
+                                acc + 2
+                            } else if byte < 16 {
+                                acc + 1
+                            } else {
+                                acc
+                            }
+                        });
+
+                        if score > local_best_score
+                            || (score == local_best_score && n < local_best_nonce)
+                        {
+                            local_best_score = score;
                             local_best_nonce = n;
-                            local_best_hash = result;
+                            local_best_hash.copy_from_slice(&result);
                         }
+
+                        nonce_start = increment_nonce(buffer, nonce_start);
                     }
 
                     let current_best_score = global_best_score.load(Ordering::Relaxed);
-                    if local_best_score > current_best_score as u32
-                        || (local_best_score == current_best_score as u32
+                    if local_best_score > current_best_score
+                        || (local_best_score == current_best_score
                             && local_best_nonce < global_best_nonce.load(Ordering::Relaxed))
                     {
                         if global_best_score
-                            .compare_exchange_weak(
+                            .compare_exchange(
                                 current_best_score,
-                                local_best_score as usize,
+                                local_best_score,
                                 Ordering::Release,
                                 Ordering::Relaxed,
                             )
                             .is_ok()
                         {
                             global_best_nonce.store(local_best_nonce, Ordering::Relaxed);
-                            let hash_str = hex::encode(&local_best_hash);
                             let mut global_hash = global_best_hash.write();
-                            *global_hash = hash_str;
+                            *global_hash = local_best_hash;
 
                             println!(
                                 "\nNew min with {} zeroes: {} -> {}\n",
                                 local_best_score,
                                 format!("{}{}", prefix, local_best_nonce),
-                                *global_hash
+                                hex::encode(&*global_hash)
                             );
                         }
                     }
@@ -172,7 +195,7 @@ fn main() {
             hps / 1e6,
             global_best_score.load(Ordering::Relaxed),
             format!("{}{}", prefix, global_best_nonce.load(Ordering::Relaxed)),
-            global_best_hash.read().clone()
+            hex::encode(&*global_best_hash.read())
         );
     }
 }
