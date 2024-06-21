@@ -95,6 +95,7 @@ fn main() {
         .as_bytes();
 
     let mut global_best_score = 0;
+    let mut global_best_nonce = 0;
     let global_best_hash = Arc::new(Mutex::new(String::new()));
     let mut current_start = start;
 
@@ -112,26 +113,36 @@ fn main() {
             .reduce_with(|a, b| if a.2 > b.2 { a } else { b })
             .unwrap();
 
-        let best_hash_str = hex::encode(&local_best_hash);
+        let local_best_hash_str = hex::encode(&local_best_hash);
         let elapsed = begin.elapsed();
         let hps = batch_size as f64 / elapsed.as_secs_f64();
 
         current_start += batch_size;
 
-        println!("{} @ {:5.2} MH/s", current_start, hps / 1e6);
-
         let mut global_best_hash_guard = global_best_hash.lock().unwrap();
+
         if (local_best_score > global_best_score)
-            || (local_best_score == global_best_score && best_hash_str < *global_best_hash_guard)
+            || (local_best_score == global_best_score
+                && local_best_hash_str < *global_best_hash_guard)
         {
             println!(
-                "New min with {} zeroes: {} -> {}",
+                "\nNew min with {} zeroes: {} -> {}\n",
                 local_best_score,
                 format!("{}{}", String::from_utf8_lossy(prefix), local_best_nonce),
-                best_hash_str
+                local_best_hash_str
             );
             global_best_score = local_best_score;
-            *global_best_hash_guard = best_hash_str.clone();
+            global_best_nonce = local_best_nonce;
+            *global_best_hash_guard = local_best_hash_str.clone();
         }
+
+        println!(
+            "{} @ {:5.2} MH/s :: ({}) {} -> {}",
+            current_start,
+            hps / 1e6,
+            global_best_score,
+            format!("{}{}", String::from_utf8_lossy(prefix), global_best_nonce),
+            *global_best_hash_guard
+        );
     }
 }
