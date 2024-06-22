@@ -11,24 +11,30 @@ use std::arch::x86_64::*;
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
-const MAX_PREFIX_LEN: usize = 32;
+const MAX_PREFIX_LEN: usize = 64;
+const MAX_NONCE_LEN: usize = 64;
+const BUFFER_LEN: usize = MAX_PREFIX_LEN + MAX_NONCE_LEN;
 
 #[inline(always)]
-fn increment_nonce(buffer: &mut [u8; 64], start: usize) -> usize {
-    let mut i = start - 1;
-    loop {
+fn increment_nonce(buffer: &mut [u8], start: usize, end: usize) -> usize {
+    let mut i = end - 1;
+    while i >= start {
         if buffer[i] == b'9' {
             buffer[i] = b'0';
-            if i == 0 {
+            if i == start {
+                for j in (start + 1..=end).rev() {
+                    buffer[j] = buffer[j - 1];
+                }
                 buffer[start] = b'1';
-                return start + 1;
+                return end + 1;
             }
-            i -= 1;
         } else {
             buffer[i] += 1;
-            return start;
+            return end;
         }
+        i -= 1;
     }
+    end
 }
 
 #[inline(always)]
@@ -48,9 +54,9 @@ fn get_nonce_start_delta(mut n: u64, buf: &mut [u8]) -> usize {
 }
 
 #[inline(always)]
-fn hex_encode(bytes: &[u8; 32]) -> String {
+fn hex_encode(bytes: &[u8]) -> String {
     const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(64);
+    let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
         s.push(HEX_CHARS[(b >> 4) as usize] as char);
         s.push(HEX_CHARS[(b & 0xf) as usize] as char);
@@ -158,9 +164,10 @@ fn main() {
         .get_one::<String>("prefix")
         .expect("prefix argument is required");
 
-    let mut prefix_bytes = [0u8; MAX_PREFIX_LEN];
-    let prefix_len = prefix.len().min(MAX_PREFIX_LEN);
-    prefix_bytes[..prefix_len].copy_from_slice(&prefix.as_bytes()[..prefix_len]);
+    let prefix_len = prefix.len();
+    if prefix_len > MAX_PREFIX_LEN {
+        panic!("Prefix is too long. Maximum length is {}", MAX_PREFIX_LEN);
+    }
 
     let global_best_score = Arc::new(AtomicU32::new(0));
     let global_best_nonce = Arc::new(AtomicUsize::new(0));
@@ -177,18 +184,12 @@ fn main() {
             .into_par_iter()
             .step_by(16384)
             .for_each_with(
-                (Sha256::new(), [0u8; 64]),
+                (Sha256::new(), [0u8; BUFFER_LEN]),
                 |(hasher, buffer), chunk_start| {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            prefix_bytes.as_ptr(),
-                            buffer.as_mut_ptr(),
-                            prefix_len,
-                        );
-                    }
-                    let mut nonce_start = prefix_len;
-                    nonce_start +=
-                        get_nonce_start_delta(chunk_start as u64, &mut buffer[nonce_start..]);
+                    buffer[..prefix_len].copy_from_slice(prefix.as_bytes());
+                    let nonce_start = prefix_len;
+                    let mut nonce_end = nonce_start
+                        + get_nonce_start_delta(chunk_start as u64, &mut buffer[nonce_start..]);
 
                     let chunk_end = (chunk_start + 16384).min(range_end);
                     let mut local_best_score = 0;
@@ -196,7 +197,7 @@ fn main() {
                     let mut local_best_hash = [0u8; 32];
 
                     for n in chunk_start..chunk_end {
-                        hasher.update(&buffer[..nonce_start]);
+                        hasher.update(&buffer[..nonce_end]);
                         let result = hasher.finalize_reset();
 
                         let score = unsafe { calculate_score(result.as_ref()) };
@@ -209,7 +210,7 @@ fn main() {
                             local_best_hash.copy_from_slice(&result);
                         }
 
-                        nonce_start = increment_nonce(buffer, nonce_start);
+                        nonce_end = increment_nonce(buffer, nonce_start, nonce_end);
                     }
 
                     let current_best_score = global_best_score.load(Ordering::Relaxed);
@@ -231,10 +232,11 @@ fn main() {
                             *global_hash = local_best_hash;
 
                             println!(
-                                "\nNew min with {} zeroes: {} -> {}\n",
+                                "\nNew min with {} zeroes: {}{} -> {}\n",
                                 local_best_score,
-                                format!("{}{}", prefix, local_best_nonce),
-                                hex_encode(&*global_hash)
+                                prefix,
+                                local_best_nonce,
+                                hex_encode(&local_best_hash)
                             );
                         }
                     }
@@ -247,11 +249,12 @@ fn main() {
         current_start.fetch_add(batch_size as usize, Ordering::Relaxed);
 
         println!(
-            "{} @ {:5.2} MH/s :: ({}) {} -> {}",
+            "{} @ {:5.2} MH/s :: ({}) {}{} -> {}",
             range_end,
             hps / 1e6,
             global_best_score.load(Ordering::Relaxed),
-            format!("{}{}", prefix, global_best_nonce.load(Ordering::Relaxed)),
+            prefix,
+            global_best_nonce.load(Ordering::Relaxed),
             hex_encode(&*global_best_hash.read())
         );
     }
