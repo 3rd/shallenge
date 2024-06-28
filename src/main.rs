@@ -73,24 +73,28 @@ unsafe fn calculate_score(result: &[u8; 32]) -> u32 {
 
     for chunk in result.chunks(16) {
         let v = _mm_loadu_si128(chunk.as_ptr() as *const __m128i);
-        let full_zero_mask = _mm_cmpeq_epi8(v, zero);
-        let full_zero_bits = _mm_movemask_epi8(full_zero_mask) as u32;
+        let high_nibbles = _mm_and_si128(_mm_srli_epi16(v, 4), low_mask);
+        let low_nibbles = _mm_and_si128(v, low_mask);
 
-        if full_zero_bits != 0xFFFF {
-            let low_nibbles = _mm_and_si128(v, low_mask);
-            let half_zero_mask = _mm_cmpeq_epi8(low_nibbles, zero);
-            let half_zero_bits = _mm_movemask_epi8(half_zero_mask) as u32;
+        let high_zero_mask = _mm_cmpeq_epi8(high_nibbles, zero);
+        let low_zero_mask = _mm_cmpeq_epi8(low_nibbles, zero);
 
-            let leading_full_zeros = full_zero_bits.trailing_ones();
-            score += leading_full_zeros * 2;
+        let high_zero_bits = _mm_movemask_epi8(high_zero_mask);
+        let low_zero_bits = _mm_movemask_epi8(low_zero_mask);
 
-            if (half_zero_bits & !full_zero_bits) & (1 << leading_full_zeros) != 0 {
-                score += 1;
+        for i in 0..16 {
+            if (high_zero_bits & (1 << i)) == 0 {
+                return score;
             }
-            break;
+            score += 1;
+
+            if (low_zero_bits & (1 << i)) == 0 {
+                return score;
+            }
+            score += 1;
         }
-        score += 32;
     }
+
     score
 }
 
